@@ -9,7 +9,7 @@ create table if not exists public.meetings (
   created_at timestamptz not null default now(),
 
   title text,
-  status text not null default 'uploaded', -- uploaded | processing | ready | error
+  status text not null default 'uploaded', -- recording | uploading | uploaded | processing | ready | error
   started_at timestamptz,
   ended_at timestamptz,
   duration_seconds int,
@@ -92,4 +92,3 @@ create policy "meeting_messages_delete_own"
   on public.meeting_messages for delete
   to authenticated
   using (auth.uid() = user_id);
-

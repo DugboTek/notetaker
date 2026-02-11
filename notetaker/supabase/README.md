@@ -11,7 +11,9 @@ This app expects:
 ## Quick Start
 
 1. Create a Supabase project.
-2. In Supabase SQL editor, run `supabase/migrations/0001_init.sql`.
+2. In Supabase SQL editor, run:
+   - `supabase/migrations/0001_init.sql`
+   - `supabase/migrations/0002_meeting_chunks.sql`
 3. Create a storage bucket named `meeting-audio` (private).
    - Optional: the app will auto-create it on first upload if it doesn't exist.
 4. Copy keys into `notetaker/.env.local`:
@@ -22,3 +24,5 @@ This app expects:
 
 Notes:
 - For local Supabase (CLI), you may only see legacy `anon` / `service_role` keys. The app accepts those via fallback env vars too.
+- Audio is uploaded directly from the browser to Supabase Storage using a signed upload token (so deployments on Vercel won't hit function payload limits).
+- Long meetings are stored as many small chunks and processed incrementally.

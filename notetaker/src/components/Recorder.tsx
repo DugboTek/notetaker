@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { encodeWav16kMono } from "@/lib/wav";
 import { errorMessage } from "@/lib/errors";
+import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 type RecorderState = "idle" | "recording" | "uploading" | "processing" | "error";
 
@@ -18,13 +18,17 @@ export function Recorder() {
   const [state, setState] = useState<RecorderState>("idle");
   const [error, setError] = useState<string>("");
   const [seconds, setSeconds] = useState(0);
+  const [uploadedChunks, setUploadedChunks] = useState(0);
 
+  const meetingIdRef = useRef<string>("");
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const chunksRef = useRef<Float32Array[]>([]);
-  const sampleRateRef = useRef<number>(48000);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mimeTypeRef = useRef<string>("audio/webm");
   const startedAtRef = useRef<number>(0);
+  const seqRef = useRef<number>(0);
+  const uploadQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const uploadErrorRef = useRef<string>("");
+  const totalBytesRef = useRef<number>(0);
 
   const canStart = state === "idle" || state === "error";
   const canStop = state === "recording";
@@ -37,93 +41,178 @@ export function Recorder() {
 
   const reset = useCallback(() => {
     setSeconds(0);
+    setUploadedChunks(0);
     setError("");
     setState("idle");
+    meetingIdRef.current = "";
+    seqRef.current = 0;
+    totalBytesRef.current = 0;
+    uploadErrorRef.current = "";
+    uploadQueueRef.current = Promise.resolve();
+  }, []);
+
+  const chooseMimeType = useCallback(() => {
+    const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus", "audio/ogg"];
+    for (const c of candidates) {
+      if (typeof MediaRecorder !== "undefined" && typeof MediaRecorder.isTypeSupported === "function" && MediaRecorder.isTypeSupported(c)) {
+        return c;
+      }
+    }
+    return "";
   }, []);
 
   const stopInternal = useCallback(async () => {
-    processorRef.current?.disconnect();
-    processorRef.current = null;
-
-    audioContextRef.current?.close();
-    audioContextRef.current = null;
+    const rec = mediaRecorderRef.current;
+    if (rec && rec.state !== "inactive") {
+      try {
+        rec.stop();
+      } catch {
+        // ignore
+      }
+    }
+    mediaRecorderRef.current = null;
 
     mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
     mediaStreamRef.current = null;
   }, []);
 
+  const uploadChunk = useCallback(async (blob: Blob, seq: number) => {
+    const meetingId = meetingIdRef.current;
+    if (!meetingId) throw new Error("Missing meeting id");
+    if (uploadErrorRef.current) return;
+    if (!blob.size) return;
+
+    const mimeType = mimeTypeRef.current || blob.type || "audio/webm";
+    totalBytesRef.current += blob.size;
+
+    const signRes = await fetch(`/api/meetings/${meetingId}/chunks/sign`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        seq,
+        mimeType,
+        sizeBytes: blob.size,
+      }),
+    });
+    if (!signRes.ok) throw new Error(await signRes.text());
+    const signJson = (await signRes.json()) as { chunkId: string; bucket: string; path: string; token: string };
+
+    const supabase = createSupabaseBrowserClient();
+    const { error: upErr } = await supabase.storage
+      .from(signJson.bucket)
+      .uploadToSignedUrl(signJson.path, signJson.token, blob, { contentType: mimeType });
+    if (upErr) throw new Error(`Chunk upload failed: ${upErr.message}`);
+
+    const doneRes = await fetch(`/api/meetings/${meetingId}/chunks/uploaded`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chunkId: signJson.chunkId,
+        sizeBytes: blob.size,
+      }),
+    });
+    if (!doneRes.ok) throw new Error(await doneRes.text());
+
+    setUploadedChunks((n) => n + 1);
+  }, []);
+
+  const enqueueUpload = useCallback(
+    (blob: Blob, seq: number) => {
+      uploadQueueRef.current = uploadQueueRef.current.then(async () => {
+        try {
+          await uploadChunk(blob, seq);
+        } catch (e: unknown) {
+          uploadErrorRef.current = errorMessage(e) || "Chunk upload failed.";
+        }
+      });
+      return uploadQueueRef.current;
+    },
+    [uploadChunk],
+  );
+
   const start = useCallback(async () => {
     setError("");
     setSeconds(0);
-    chunksRef.current = [];
+    setUploadedChunks(0);
     startedAtRef.current = Date.now();
+    seqRef.current = 0;
+    totalBytesRef.current = 0;
+    uploadErrorRef.current = "";
+    uploadQueueRef.current = Promise.resolve();
 
     try {
+      // Initialize meeting immediately so chunks can stream to storage.
+      const initRes = await fetch("/api/meetings/upload", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ startedAtMs: startedAtRef.current }),
+      });
+      if (!initRes.ok) throw new Error(await initRes.text());
+      const initJson = (await initRes.json()) as { id: string };
+      meetingIdRef.current = initJson.id;
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
-      const AudioContextCtor = window.AudioContext ?? window.webkitAudioContext;
-      if (!AudioContextCtor) throw new Error("AudioContext is not supported in this browser.");
-      const audioContext = new AudioContextCtor();
-      audioContextRef.current = audioContext;
-      sampleRateRef.current = audioContext.sampleRate;
+      if (typeof MediaRecorder === "undefined") throw new Error("MediaRecorder is not supported in this browser.");
 
-      // ScriptProcessorNode is deprecated but still broadly supported; good enough for an MVP.
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
+      const mimeType = chooseMimeType();
+      mimeTypeRef.current = mimeType || "audio/webm";
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      mediaRecorderRef.current = recorder;
 
-      const source = audioContext.createMediaStreamSource(stream);
-      source.connect(processor);
-      processor.connect(audioContext.destination);
-
-      processor.onaudioprocess = (e) => {
-        const input = e.inputBuffer.getChannelData(0);
-        chunksRef.current.push(new Float32Array(input));
+      recorder.ondataavailable = (e) => {
+        if (!e.data || e.data.size === 0) return;
+        const seq = seqRef.current;
+        seqRef.current += 1;
+        void enqueueUpload(e.data, seq);
       };
 
-      // iOS Safari sometimes starts suspended.
-      if (audioContext.state === "suspended") await audioContext.resume();
-
+      // 15s chunks keep memory low and avoid too many requests.
+      recorder.start(15_000);
       setState("recording");
     } catch (e: unknown) {
       setState("error");
       setError(errorMessage(e) || "Microphone permission failed.");
       await stopInternal();
     }
-  }, [stopInternal]);
+  }, [chooseMimeType, enqueueUpload, stopInternal]);
 
   const stop = useCallback(async () => {
     setState("uploading");
     try {
+      const rec = mediaRecorderRef.current;
+      if (rec && rec.state !== "inactive") {
+        await new Promise<void>((resolve) => {
+          rec.addEventListener("stop", () => resolve(), { once: true });
+          rec.stop();
+        });
+      }
       await stopInternal();
 
-      const chunks = chunksRef.current;
-      const total = chunks.reduce((n, c) => n + c.length, 0);
-      const merged = new Float32Array(total);
-      let off = 0;
-      for (const c of chunks) {
-        merged.set(c, off);
-        off += c.length;
-      }
+      await uploadQueueRef.current;
+      if (uploadErrorRef.current) throw new Error(uploadErrorRef.current);
 
-      const wavBytes = encodeWav16kMono(merged, sampleRateRef.current);
-      const blob = new Blob([wavBytes], { type: "audio/wav" });
+      const meetingId = meetingIdRef.current;
+      if (!meetingId) throw new Error("Missing meeting id");
 
-      const form = new FormData();
-      form.append("audio", blob, `meeting-${new Date().toISOString()}.wav`);
-      form.append("startedAtMs", String(startedAtRef.current));
-      form.append("endedAtMs", String(Date.now()));
-      form.append("durationSeconds", String(seconds));
-
-      const uploadRes = await fetch("/api/meetings/upload", { method: "POST", body: form });
-      if (!uploadRes.ok) throw new Error(await uploadRes.text());
-      const uploadJson = (await uploadRes.json()) as { id: string };
+      const finRes = await fetch(`/api/meetings/${meetingId}/uploaded`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          endedAtMs: Date.now(),
+          durationSeconds: seconds,
+          totalBytes: totalBytesRef.current,
+          mimeType: mimeTypeRef.current || "audio/webm",
+        }),
+      });
+      if (!finRes.ok) throw new Error(await finRes.text());
 
       setState("processing");
-      const procRes = await fetch(`/api/meetings/${uploadJson.id}/process`, { method: "POST" });
-      if (!procRes.ok) throw new Error(await procRes.text());
+      // Kick processing once; meeting page will continue polling.
+      await fetch(`/api/meetings/${meetingId}/process`, { method: "POST" });
 
-      router.push(`/meetings/${uploadJson.id}`);
+      router.push(`/meetings/${meetingId}`);
       router.refresh();
     } catch (e: unknown) {
       setState("error");
@@ -145,21 +234,19 @@ export function Recorder() {
         <div>
           <div className="text-xs font-medium tracking-wide text-black/60">{badge}</div>
           <div className="mt-1 text-2xl font-semibold tracking-tight">{formatTime(seconds)}</div>
-          <div className="mt-1 text-sm text-black/60">
-            Record a meeting from your phone mic. Keep this tab open while recording.
-          </div>
+          <div className="mt-1 text-sm text-black/60">Live chunk upload is enabled for long meetings. Uploaded chunks: {uploadedChunks}</div>
         </div>
         <div className="flex gap-2">
           <button
             className="rounded-full bg-black px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40"
-            onClick={start}
+            onClick={() => void start()}
             disabled={!canStart}
           >
             Start
           </button>
           <button
             className="rounded-full border border-black/15 bg-white px-4 py-2 text-sm font-semibold text-black disabled:cursor-not-allowed disabled:opacity-40"
-            onClick={stop}
+            onClick={() => void stop()}
             disabled={!canStop}
           >
             Stop

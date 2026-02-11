@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
+import { MeetingAutoProcessor } from "@/components/MeetingAutoProcessor";
 import { MeetingChat, type MeetingChatMessage } from "@/components/MeetingChat";
 import { MeetingNotes } from "@/components/MeetingNotes";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -91,6 +92,8 @@ export default async function MeetingPage(props: PageProps) {
 
       <main className="mx-auto grid max-w-5xl gap-6 px-6 pb-12 lg:grid-cols-2">
         <div className="space-y-6">
+          <MeetingAutoProcessor meetingId={id} initialStatus={String(meeting.status)} />
+
           {meeting.error ? (
             <section className="rounded-2xl border border-red-200 bg-red-50 p-5 text-sm text-red-800">
               <div className="font-semibold">Processing error</div>
