@@ -12,6 +12,7 @@ Record a meeting on your phone mic, then:
 1. Supabase
    - Create a project
    - Run `supabase/migrations/0001_init.sql`
+   - Run `supabase/migrations/0002_meeting_chunks.sql`
    - Create a private Storage bucket: `meeting-audio` (or set `MEETING_AUDIO_BUCKET`)
 2. Google Gemini
    - Create an API key (Google AI Studio)
@@ -33,3 +34,4 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
 - Supabase renamed the client key from “anon” to “publishable”. This app uses `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` (and falls back to `NEXT_PUBLIC_SUPABASE_ANON_KEY` for legacy/local setups).
 - Gemini processing runs server-side so the API key stays off the device.
 - On Vercel, meeting audio uploads go directly to Supabase Storage via signed upload URLs (so you don't hit function payload limits).
+- For long meetings, recording uploads in small chunks and processing runs incrementally until complete.

@@ -7,10 +7,8 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 const bodySchema = z.object({
-  endedAtMs: z.number().optional(),
-  durationSeconds: z.number().optional(),
-  totalBytes: z.number().optional(),
-  mimeType: z.string().optional(),
+  chunkId: z.string().uuid(),
+  sizeBytes: z.number().int().nonnegative().optional(),
 });
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
@@ -22,25 +20,22 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   } = await supabase.auth.getUser();
   if (!user) return new NextResponse("Unauthorized", { status: 401 });
 
-  const body = bodySchema.safeParse(await req.json().catch(() => ({})));
+  const body = bodySchema.safeParse(await req.json().catch(() => null));
   if (!body.success) return new NextResponse("Invalid body", { status: 400 });
 
   const admin = createSupabaseAdminClient();
-  const endedAt = body.data.endedAtMs ? new Date(body.data.endedAtMs).toISOString() : null;
-
   const { error } = await admin
-    .from("meetings")
+    .from("meeting_chunks")
     .update({
       status: "uploaded",
-      ended_at: endedAt,
-      duration_seconds: body.data.durationSeconds ?? null,
-      audio_size_bytes: body.data.totalBytes ?? null,
-      audio_mime: body.data.mimeType ?? null,
+      audio_size_bytes: body.data.sizeBytes ?? null,
       error: null,
     })
-    .eq("id", id)
+    .eq("id", body.data.chunkId)
+    .eq("meeting_id", id)
     .eq("user_id", user.id);
   if (error) return new NextResponse(error.message, { status: 500 });
 
   return NextResponse.json({ ok: true });
 }
+

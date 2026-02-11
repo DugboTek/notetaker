@@ -18,12 +18,17 @@ export function Recorder() {
   const [state, setState] = useState<RecorderState>("idle");
   const [error, setError] = useState<string>("");
   const [seconds, setSeconds] = useState(0);
+  const [uploadedChunks, setUploadedChunks] = useState(0);
 
+  const meetingIdRef = useRef<string>("");
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<BlobPart[]>([]);
   const mimeTypeRef = useRef<string>("audio/webm");
   const startedAtRef = useRef<number>(0);
+  const seqRef = useRef<number>(0);
+  const uploadQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const uploadErrorRef = useRef<string>("");
+  const totalBytesRef = useRef<number>(0);
 
   const canStart = state === "idle" || state === "error";
   const canStop = state === "recording";
@@ -36,8 +41,24 @@ export function Recorder() {
 
   const reset = useCallback(() => {
     setSeconds(0);
+    setUploadedChunks(0);
     setError("");
     setState("idle");
+    meetingIdRef.current = "";
+    seqRef.current = 0;
+    totalBytesRef.current = 0;
+    uploadErrorRef.current = "";
+    uploadQueueRef.current = Promise.resolve();
+  }, []);
+
+  const chooseMimeType = useCallback(() => {
+    const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus", "audio/ogg"];
+    for (const c of candidates) {
+      if (typeof MediaRecorder !== "undefined" && typeof MediaRecorder.isTypeSupported === "function" && MediaRecorder.isTypeSupported(c)) {
+        return c;
+      }
+    }
+    return "";
   }, []);
 
   const stopInternal = useCallback(async () => {
@@ -55,24 +76,81 @@ export function Recorder() {
     mediaStreamRef.current = null;
   }, []);
 
-  const chooseMimeType = useCallback(() => {
-    // Prefer Opus-in-webm when available (small uploads).
-    const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus", "audio/ogg"];
-    for (const c of candidates) {
-      if (typeof MediaRecorder !== "undefined" && typeof MediaRecorder.isTypeSupported === "function" && MediaRecorder.isTypeSupported(c)) {
-        return c;
-      }
-    }
-    return "";
+  const uploadChunk = useCallback(async (blob: Blob, seq: number) => {
+    const meetingId = meetingIdRef.current;
+    if (!meetingId) throw new Error("Missing meeting id");
+    if (uploadErrorRef.current) return;
+    if (!blob.size) return;
+
+    const mimeType = mimeTypeRef.current || blob.type || "audio/webm";
+    totalBytesRef.current += blob.size;
+
+    const signRes = await fetch(`/api/meetings/${meetingId}/chunks/sign`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        seq,
+        mimeType,
+        sizeBytes: blob.size,
+      }),
+    });
+    if (!signRes.ok) throw new Error(await signRes.text());
+    const signJson = (await signRes.json()) as { chunkId: string; bucket: string; path: string; token: string };
+
+    const supabase = createSupabaseBrowserClient();
+    const { error: upErr } = await supabase.storage
+      .from(signJson.bucket)
+      .uploadToSignedUrl(signJson.path, signJson.token, blob, { contentType: mimeType });
+    if (upErr) throw new Error(`Chunk upload failed: ${upErr.message}`);
+
+    const doneRes = await fetch(`/api/meetings/${meetingId}/chunks/uploaded`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chunkId: signJson.chunkId,
+        sizeBytes: blob.size,
+      }),
+    });
+    if (!doneRes.ok) throw new Error(await doneRes.text());
+
+    setUploadedChunks((n) => n + 1);
   }, []);
+
+  const enqueueUpload = useCallback(
+    (blob: Blob, seq: number) => {
+      uploadQueueRef.current = uploadQueueRef.current.then(async () => {
+        try {
+          await uploadChunk(blob, seq);
+        } catch (e: unknown) {
+          uploadErrorRef.current = errorMessage(e) || "Chunk upload failed.";
+        }
+      });
+      return uploadQueueRef.current;
+    },
+    [uploadChunk],
+  );
 
   const start = useCallback(async () => {
     setError("");
     setSeconds(0);
-    chunksRef.current = [];
+    setUploadedChunks(0);
     startedAtRef.current = Date.now();
+    seqRef.current = 0;
+    totalBytesRef.current = 0;
+    uploadErrorRef.current = "";
+    uploadQueueRef.current = Promise.resolve();
 
     try {
+      // Initialize meeting immediately so chunks can stream to storage.
+      const initRes = await fetch("/api/meetings/upload", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ startedAtMs: startedAtRef.current }),
+      });
+      if (!initRes.ok) throw new Error(await initRes.text());
+      const initJson = (await initRes.json()) as { id: string };
+      meetingIdRef.current = initJson.id;
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
@@ -80,71 +158,61 @@ export function Recorder() {
 
       const mimeType = chooseMimeType();
       mimeTypeRef.current = mimeType || "audio/webm";
-
       const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+        if (!e.data || e.data.size === 0) return;
+        const seq = seqRef.current;
+        seqRef.current += 1;
+        void enqueueUpload(e.data, seq);
       };
 
-      recorder.start(1000);
+      // 15s chunks keep memory low and avoid too many requests.
+      recorder.start(15_000);
       setState("recording");
     } catch (e: unknown) {
       setState("error");
       setError(errorMessage(e) || "Microphone permission failed.");
       await stopInternal();
     }
-  }, [chooseMimeType, stopInternal]);
+  }, [chooseMimeType, enqueueUpload, stopInternal]);
 
   const stop = useCallback(async () => {
     setState("uploading");
     try {
-      // Stop and wait for final chunk flush.
       const rec = mediaRecorderRef.current;
       if (rec && rec.state !== "inactive") {
         await new Promise<void>((resolve) => {
-          const onStop = () => resolve();
-          rec.addEventListener("stop", onStop, { once: true });
+          rec.addEventListener("stop", () => resolve(), { once: true });
           rec.stop();
         });
       }
       await stopInternal();
 
-      const mimeType = mimeTypeRef.current || "audio/webm";
-      const blob = new Blob(chunksRef.current, { type: mimeType });
+      await uploadQueueRef.current;
+      if (uploadErrorRef.current) throw new Error(uploadErrorRef.current);
 
-      // 1) Init upload (small JSON). Server returns a signed upload token.
-      const initRes = await fetch("/api/meetings/upload", {
+      const meetingId = meetingIdRef.current;
+      if (!meetingId) throw new Error("Missing meeting id");
+
+      const finRes = await fetch(`/api/meetings/${meetingId}/uploaded`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          startedAtMs: startedAtRef.current,
           endedAtMs: Date.now(),
           durationSeconds: seconds,
-          mimeType,
-          sizeBytes: blob.size,
+          totalBytes: totalBytesRef.current,
+          mimeType: mimeTypeRef.current || "audio/webm",
         }),
       });
-      if (!initRes.ok) throw new Error(await initRes.text());
-      const initJson = (await initRes.json()) as { id: string; bucket: string; path: string; token: string };
-
-      // 2) Upload directly to Supabase Storage (avoids Vercel payload limits).
-      const supabase = createSupabaseBrowserClient();
-      const { error: upErr } = await supabase.storage
-        .from(initJson.bucket)
-        .uploadToSignedUrl(initJson.path, initJson.token, blob, { contentType: mimeType });
-      if (upErr) throw new Error(`Storage upload failed: ${upErr.message}`);
-
-      // 3) Mark uploaded, then process.
-      const finRes = await fetch(`/api/meetings/${initJson.id}/uploaded`, { method: "POST" });
       if (!finRes.ok) throw new Error(await finRes.text());
 
       setState("processing");
-      const procRes = await fetch(`/api/meetings/${initJson.id}/process`, { method: "POST" });
-      if (!procRes.ok) throw new Error(await procRes.text());
+      // Kick processing once; meeting page will continue polling.
+      await fetch(`/api/meetings/${meetingId}/process`, { method: "POST" });
 
-      router.push(`/meetings/${initJson.id}`);
+      router.push(`/meetings/${meetingId}`);
       router.refresh();
     } catch (e: unknown) {
       setState("error");
@@ -166,7 +234,7 @@ export function Recorder() {
         <div>
           <div className="text-xs font-medium tracking-wide text-black/60">{badge}</div>
           <div className="mt-1 text-2xl font-semibold tracking-tight">{formatTime(seconds)}</div>
-          <div className="mt-1 text-sm text-black/60">Record a meeting from your phone mic. Keep this tab open while recording.</div>
+          <div className="mt-1 text-sm text-black/60">Live chunk upload is enabled for long meetings. Uploaded chunks: {uploadedChunks}</div>
         </div>
         <div className="flex gap-2">
           <button
@@ -196,4 +264,3 @@ export function Recorder() {
     </section>
   );
 }
-
