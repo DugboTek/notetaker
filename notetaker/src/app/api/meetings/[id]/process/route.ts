@@ -47,7 +47,7 @@ export async function POST(_req: Request, ctx: { params: Promise<{ id: string }>
 
     const blob = dl.data as Blob;
     const bytes = new Uint8Array(await blob.arrayBuffer());
-    const mimeType = meeting.audio_mime || "audio/wav";
+    const mimeType = meeting.audio_mime || "application/octet-stream";
 
     const file = await uploadToGeminiFiles({
       bytes,

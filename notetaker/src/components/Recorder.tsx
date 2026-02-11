@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { encodeWav16kMono } from "@/lib/wav";
 import { errorMessage } from "@/lib/errors";
+import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 type RecorderState = "idle" | "recording" | "uploading" | "processing" | "error";
 
@@ -20,10 +20,9 @@ export function Recorder() {
   const [seconds, setSeconds] = useState(0);
 
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const chunksRef = useRef<Float32Array[]>([]);
-  const sampleRateRef = useRef<number>(48000);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<BlobPart[]>([]);
+  const mimeTypeRef = useRef<string>("audio/webm");
   const startedAtRef = useRef<number>(0);
 
   const canStart = state === "idle" || state === "error";
@@ -42,14 +41,29 @@ export function Recorder() {
   }, []);
 
   const stopInternal = useCallback(async () => {
-    processorRef.current?.disconnect();
-    processorRef.current = null;
-
-    audioContextRef.current?.close();
-    audioContextRef.current = null;
+    const rec = mediaRecorderRef.current;
+    if (rec && rec.state !== "inactive") {
+      try {
+        rec.stop();
+      } catch {
+        // ignore
+      }
+    }
+    mediaRecorderRef.current = null;
 
     mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
     mediaStreamRef.current = null;
+  }, []);
+
+  const chooseMimeType = useCallback(() => {
+    // Prefer Opus-in-webm when available (small uploads).
+    const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus", "audio/ogg"];
+    for (const c of candidates) {
+      if (typeof MediaRecorder !== "undefined" && typeof MediaRecorder.isTypeSupported === "function" && MediaRecorder.isTypeSupported(c)) {
+        return c;
+      }
+    }
+    return "";
   }, []);
 
   const start = useCallback(async () => {
@@ -62,68 +76,75 @@ export function Recorder() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
-      const AudioContextCtor = window.AudioContext ?? window.webkitAudioContext;
-      if (!AudioContextCtor) throw new Error("AudioContext is not supported in this browser.");
-      const audioContext = new AudioContextCtor();
-      audioContextRef.current = audioContext;
-      sampleRateRef.current = audioContext.sampleRate;
+      if (typeof MediaRecorder === "undefined") throw new Error("MediaRecorder is not supported in this browser.");
 
-      // ScriptProcessorNode is deprecated but still broadly supported; good enough for an MVP.
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
+      const mimeType = chooseMimeType();
+      mimeTypeRef.current = mimeType || "audio/webm";
 
-      const source = audioContext.createMediaStreamSource(stream);
-      source.connect(processor);
-      processor.connect(audioContext.destination);
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      mediaRecorderRef.current = recorder;
 
-      processor.onaudioprocess = (e) => {
-        const input = e.inputBuffer.getChannelData(0);
-        chunksRef.current.push(new Float32Array(input));
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
       };
 
-      // iOS Safari sometimes starts suspended.
-      if (audioContext.state === "suspended") await audioContext.resume();
-
+      recorder.start(1000);
       setState("recording");
     } catch (e: unknown) {
       setState("error");
       setError(errorMessage(e) || "Microphone permission failed.");
       await stopInternal();
     }
-  }, [stopInternal]);
+  }, [chooseMimeType, stopInternal]);
 
   const stop = useCallback(async () => {
     setState("uploading");
     try {
+      // Stop and wait for final chunk flush.
+      const rec = mediaRecorderRef.current;
+      if (rec && rec.state !== "inactive") {
+        await new Promise<void>((resolve) => {
+          const onStop = () => resolve();
+          rec.addEventListener("stop", onStop, { once: true });
+          rec.stop();
+        });
+      }
       await stopInternal();
 
-      const chunks = chunksRef.current;
-      const total = chunks.reduce((n, c) => n + c.length, 0);
-      const merged = new Float32Array(total);
-      let off = 0;
-      for (const c of chunks) {
-        merged.set(c, off);
-        off += c.length;
-      }
+      const mimeType = mimeTypeRef.current || "audio/webm";
+      const blob = new Blob(chunksRef.current, { type: mimeType });
 
-      const wavBytes = encodeWav16kMono(merged, sampleRateRef.current);
-      const blob = new Blob([wavBytes], { type: "audio/wav" });
+      // 1) Init upload (small JSON). Server returns a signed upload token.
+      const initRes = await fetch("/api/meetings/upload", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          startedAtMs: startedAtRef.current,
+          endedAtMs: Date.now(),
+          durationSeconds: seconds,
+          mimeType,
+          sizeBytes: blob.size,
+        }),
+      });
+      if (!initRes.ok) throw new Error(await initRes.text());
+      const initJson = (await initRes.json()) as { id: string; bucket: string; path: string; token: string };
 
-      const form = new FormData();
-      form.append("audio", blob, `meeting-${new Date().toISOString()}.wav`);
-      form.append("startedAtMs", String(startedAtRef.current));
-      form.append("endedAtMs", String(Date.now()));
-      form.append("durationSeconds", String(seconds));
+      // 2) Upload directly to Supabase Storage (avoids Vercel payload limits).
+      const supabase = createSupabaseBrowserClient();
+      const { error: upErr } = await supabase.storage
+        .from(initJson.bucket)
+        .uploadToSignedUrl(initJson.path, initJson.token, blob, { contentType: mimeType });
+      if (upErr) throw new Error(`Storage upload failed: ${upErr.message}`);
 
-      const uploadRes = await fetch("/api/meetings/upload", { method: "POST", body: form });
-      if (!uploadRes.ok) throw new Error(await uploadRes.text());
-      const uploadJson = (await uploadRes.json()) as { id: string };
+      // 3) Mark uploaded, then process.
+      const finRes = await fetch(`/api/meetings/${initJson.id}/uploaded`, { method: "POST" });
+      if (!finRes.ok) throw new Error(await finRes.text());
 
       setState("processing");
-      const procRes = await fetch(`/api/meetings/${uploadJson.id}/process`, { method: "POST" });
+      const procRes = await fetch(`/api/meetings/${initJson.id}/process`, { method: "POST" });
       if (!procRes.ok) throw new Error(await procRes.text());
 
-      router.push(`/meetings/${uploadJson.id}`);
+      router.push(`/meetings/${initJson.id}`);
       router.refresh();
     } catch (e: unknown) {
       setState("error");
@@ -145,21 +166,19 @@ export function Recorder() {
         <div>
           <div className="text-xs font-medium tracking-wide text-black/60">{badge}</div>
           <div className="mt-1 text-2xl font-semibold tracking-tight">{formatTime(seconds)}</div>
-          <div className="mt-1 text-sm text-black/60">
-            Record a meeting from your phone mic. Keep this tab open while recording.
-          </div>
+          <div className="mt-1 text-sm text-black/60">Record a meeting from your phone mic. Keep this tab open while recording.</div>
         </div>
         <div className="flex gap-2">
           <button
             className="rounded-full bg-black px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40"
-            onClick={start}
+            onClick={() => void start()}
             disabled={!canStart}
           >
             Start
           </button>
           <button
             className="rounded-full border border-black/15 bg-white px-4 py-2 text-sm font-semibold text-black disabled:cursor-not-allowed disabled:opacity-40"
-            onClick={stop}
+            onClick={() => void stop()}
             disabled={!canStop}
           >
             Stop
@@ -177,3 +196,4 @@ export function Recorder() {
     </section>
   );
 }
+

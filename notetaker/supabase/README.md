@@ -22,3 +22,4 @@ This app expects:
 
 Notes:
 - For local Supabase (CLI), you may only see legacy `anon` / `service_role` keys. The app accepts those via fallback env vars too.
+- Audio is uploaded directly from the browser to Supabase Storage using a signed upload token (so deployments on Vercel won't hit function payload limits).

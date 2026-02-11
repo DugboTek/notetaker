@@ -29,6 +29,7 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
 
 ## Notes
 
-- The UI says "username", but Supabase Auth is email/password. We map username to `username@notetaker.local`.
+- The UI says "username", but Supabase Auth is email/password. We map usernames to `username@notetaker.user` (or use your real email if you type one).
 - Supabase renamed the client key from “anon” to “publishable”. This app uses `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` (and falls back to `NEXT_PUBLIC_SUPABASE_ANON_KEY` for legacy/local setups).
 - Gemini processing runs server-side so the API key stays off the device.
+- On Vercel, meeting audio uploads go directly to Supabase Storage via signed upload URLs (so you don't hit function payload limits).
