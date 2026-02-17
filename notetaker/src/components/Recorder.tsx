@@ -6,6 +6,7 @@ import { errorMessage } from "@/lib/errors";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 type RecorderState = "idle" | "recording" | "uploading" | "processing" | "error";
+const CHUNK_MS = 60_000;
 
 function formatTime(totalSeconds: number) {
   const m = Math.floor(totalSeconds / 60);
@@ -168,8 +169,8 @@ export function Recorder() {
         void enqueueUpload(e.data, seq);
       };
 
-      // 15s chunks keep memory low and avoid too many requests.
-      recorder.start(15_000);
+      // 60s chunks reduce total processing overhead for long meetings.
+      recorder.start(CHUNK_MS);
       setState("recording");
     } catch (e: unknown) {
       setState("error");
@@ -210,7 +211,9 @@ export function Recorder() {
 
       setState("processing");
       // Kick processing once; meeting page will continue polling.
-      await fetch(`/api/meetings/${meetingId}/process`, { method: "POST" });
+      void fetch(`/api/meetings/${meetingId}/process`, { method: "POST" }).catch(() => {
+        // Meeting page polling will continue processing even if this warm-up request fails.
+      });
 
       router.push(`/meetings/${meetingId}`);
       router.refresh();
