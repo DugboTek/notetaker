@@ -18,6 +18,10 @@ Record a meeting on your phone mic, then:
    - Create an API key (Google AI Studio)
 3. Env
    - Create `notetaker/.env.local` from `notetaker/.env.example`
+4. Vercel cron (for background processing)
+   - Set `CRON_SECRET` in Vercel env vars
+   - Optional: set `CRON_MEETING_BATCH_SIZE` (default `1`)
+   - Keep `vercel.json` in this folder so `/api/cron/process` runs every minute
 
 ## Run
 
@@ -34,4 +38,6 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
 - Supabase renamed the client key from “anon” to “publishable”. This app uses `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` (and falls back to `NEXT_PUBLIC_SUPABASE_ANON_KEY` for legacy/local setups).
 - Gemini processing runs server-side so the API key stays off the device.
 - On Vercel, meeting audio uploads go directly to Supabase Storage via signed upload URLs (so you don't hit function payload limits).
-- For long meetings, recording uploads in small chunks and processing runs incrementally until complete.
+- For long meetings, recording uploads in chunks and processing uses server-side parallel chunk workers with retries.
+- You can tune chunk-processing speed using `PROCESSING_*` env vars in `.env.example`.
+- Background processing is enabled via Vercel Cron so transcription keeps moving even if the browser tab closes.

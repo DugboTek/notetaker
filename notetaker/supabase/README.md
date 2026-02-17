@@ -25,4 +25,5 @@ This app expects:
 Notes:
 - For local Supabase (CLI), you may only see legacy `anon` / `service_role` keys. The app accepts those via fallback env vars too.
 - Audio is uploaded directly from the browser to Supabase Storage using a signed upload token (so deployments on Vercel won't hit function payload limits).
-- Long meetings are stored as many small chunks and processed incrementally.
+- Long meetings are stored as chunks and processed in parallel passes server-side.
+- In Vercel, a cron route (`/api/cron/process`) continues processing meetings in the background when the app tab is closed.

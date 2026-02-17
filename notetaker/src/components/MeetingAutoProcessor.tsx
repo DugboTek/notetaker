@@ -4,13 +4,16 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { errorMessage } from "@/lib/errors";
 
-const ACTIVE_STATUSES = new Set(["recording", "uploading", "uploaded", "processing"]);
+const ACTIVE_STATUSES = new Set(["uploading", "uploaded", "processing"]);
 
 type ProcessResponse = {
   status?: string;
   waitingUploads?: number;
   processedChunkSeq?: number;
+  processedChunks?: number;
+  totalChunks?: number;
   remainingChunks?: number;
+  shouldContinue?: boolean;
 };
 
 export function MeetingAutoProcessor(props: { meetingId: string; initialStatus: string }) {
@@ -19,6 +22,9 @@ export function MeetingAutoProcessor(props: { meetingId: string; initialStatus: 
   const [waitingUploads, setWaitingUploads] = useState<number>(0);
   const [remainingChunks, setRemainingChunks] = useState<number>(0);
   const [lastChunk, setLastChunk] = useState<number | null>(null);
+  const [processedChunks, setProcessedChunks] = useState<number>(0);
+  const [totalChunks, setTotalChunks] = useState<number>(0);
+  const [pollMs, setPollMs] = useState<number>(1200);
   const [err, setErr] = useState("");
   const inFlight = useRef(false);
 
@@ -40,6 +46,9 @@ export function MeetingAutoProcessor(props: { meetingId: string; initialStatus: 
         setStatus(nextStatus);
         setWaitingUploads(data.waitingUploads ?? 0);
         setRemainingChunks(data.remainingChunks ?? 0);
+        setProcessedChunks(data.processedChunks ?? 0);
+        setTotalChunks(data.totalChunks ?? 0);
+        setPollMs(data.shouldContinue ? 300 : 1200);
         setLastChunk(typeof data.processedChunkSeq === "number" ? data.processedChunkSeq : null);
 
         if (nextStatus === "ready" || nextStatus === "error") {
@@ -54,18 +63,19 @@ export function MeetingAutoProcessor(props: { meetingId: string; initialStatus: 
     };
 
     void tick();
-    const t = setInterval(() => void tick(), 2500);
+    const t = setInterval(() => void tick(), pollMs);
     return () => {
       stopped = true;
       clearInterval(t);
     };
-  }, [active, props.meetingId, router]);
+  }, [active, pollMs, props.meetingId, router]);
 
   if (!active && !err) return null;
 
   return (
     <section className="rounded-2xl border border-black/10 bg-white/70 p-4 text-sm text-black/70 shadow-sm backdrop-blur">
       <div className="font-semibold text-black">Processing status: {status}</div>
+      {totalChunks > 0 ? <div className="mt-1">Processed chunks: {processedChunks} / {totalChunks}</div> : null}
       {waitingUploads > 0 ? <div className="mt-1">Waiting for uploads: {waitingUploads}</div> : null}
       {typeof lastChunk === "number" ? <div className="mt-1">Last processed chunk: #{lastChunk}</div> : null}
       {remainingChunks > 0 ? <div className="mt-1">Remaining chunks: {remainingChunks}</div> : null}
@@ -73,4 +83,3 @@ export function MeetingAutoProcessor(props: { meetingId: string; initialStatus: 
     </section>
   );
 }
-
